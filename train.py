@@ -1,8 +1,16 @@
+#!/usr/bin/env python
 import os
 import csv
 import time
 import shutil
 import datetime
+from tqdm import tqdm
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+from omegaconf import OmegaConf
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -10,20 +18,24 @@ import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from tqdm import tqdm
-from pathlib import Path
-from typing import Optional
-from omegaconf import OmegaConf
-from dataclasses import dataclass
-from resnet import ResNet
+
 from dataset import ImageNetDataset
+from resnet import ResNet
+from efficientnet import EfficientNet
+
+MODELS = {'ResNet': ResNet, 'EfficientNet': EfficientNet}
+OPTIMIZERS = {'SGD': torch.optim.SGD, 'Adam': torch.optim.Adam, 'AdamW': torch.optim.AdamW}
+OPTIMIZER_PARAMS = {'SGD': {'momentum': 0.9, 'weight_decay': 0.0001}}
 
 @dataclass
 class Config:
+    model: str = 'ResNet'
+    model_size: int = 18
+    optim: str = 'Adam'
     batch_size: int = 32
     learning_rate: float = 3e-4
-    resnet_size: int = 18
     checkpoint_path: Optional[str] = None
+    save: bool = True
 
 
 def get_dataloader(split, bs, rank):
@@ -42,9 +54,9 @@ def train(rank, world_size, config, result_path):
 
     # Instantiate the model
     device = torch.device(f'cuda:{rank}')
-    model = ResNet(config.resnet_size).to(device)
+    model = MODELS[config.model](config.model_size).to(device)
     model = DDP(model, device_ids=[rank])
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    optimizer = OPTIMIZERS[config.optim](model.parameters(), lr=config.learning_rate, **OPTIMIZER_PARAMS.get(config.optim, {}))
     if config.checkpoint_path:
         model.load_state_dict(torch.load(config.checkpoint_path))
 
@@ -53,7 +65,8 @@ def train(rank, world_size, config, result_path):
     test_loader = get_dataloader('val', config.batch_size, rank)
 
     # Create results directory and csv file
-    if rank == 0:
+    save_experiment = config.save and rank == 0
+    if save_experiment:
         code_path = result_path / 'code'
         code_path.mkdir(parents=True, exist_ok=True)
 
@@ -108,8 +121,8 @@ def train(rank, world_size, config, result_path):
         train_loss, test_loss, correct1, correct5, total = \
             (all_reduce(x, device) for x in (train_loss, test_loss, correct1, correct5, total))
 
-        train_loss = train_loss / len(train_loader)
-        test_loss = test_loss / len(test_loader)
+        train_loss = train_loss / (len(train_loader) * world_size)
+        test_loss = test_loss / (len(test_loader) * world_size)
         top1_error = 100 - 100 * correct1 / total
         top5_error = 100 - 100 * correct5 / total
         epoch_duration = int(time.time() - epoch_start_time)
@@ -119,12 +132,13 @@ def train(rank, world_size, config, result_path):
                   f"Top-1 Error: {top1_error:.2f}% | Top-5 Error: {top5_error:.2f}% | "
                   f"Duration: {datetime.timedelta(seconds=epoch_duration)}")
 
+        if save_experiment:
             with open(result_path / 'results.csv', 'a') as f:
                 writer = csv.writer(f)
                 writer.writerow([epoch, train_loss, test_loss, top1_error, top5_error, epoch_duration])
 
         # Save the model checkpoint
-        if rank == 0:
+        if save_experiment:
             state_dict = {k:v.cpu() for k,v in model.state_dict().items()}
             torch.save(state_dict, result_path / f'checkpoint_{epoch}.ckpt')
 
